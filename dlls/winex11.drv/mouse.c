@@ -477,19 +477,32 @@ static BOOL grab_clipping_window( const RECT *clip )
     TRACE( "clipping to %s win %lx\n", wine_dbgstr_rect(clip), clip_window );
 
     if (!data->clipping_cursor) XUnmapWindow( data->display, clip_window );
-    pos = virtual_screen_to_root( clip->left, clip->top );
-    XMoveResizeWindow( data->display, clip_window, pos.x, pos.y,
-                       max( 1, clip->right - clip->left ), max( 1, clip->bottom - clip->top ) );
-    XMapWindow( data->display, clip_window );
+    if (!no_pointer_grab)
+    {
+        pos = virtual_screen_to_root( clip->left, clip->top );
+        XMoveResizeWindow( data->display, clip_window, pos.x, pos.y,
+                           max( 1, clip->right - clip->left ), max( 1, clip->bottom - clip->top ) );
+        XMapWindow( data->display, clip_window );
+    }
+    else
+    {
+        /* No X pointer grab, so the clip window is not needed.  Do not map it:
+         * an InputOnly window covering the clip rectangle intercepts pointer
+         * events for every window below it (including window manager
+         * decorations), so title bar buttons would stop working. */
+        TRACE( "not mapping clip window, pointer grab disabled\n" );
+    }
 
     /* if the rectangle is shrinking we may get a pointer warp */
     if (!data->clipping_cursor || clip->left > clip_rect.left || clip->top > clip_rect.top ||
         clip->right < clip_rect.right || clip->bottom < clip_rect.bottom)
         data->warp_serial = NextRequest( data->display );
 
-    if (!XGrabPointer( data->display, clip_window, False,
-                       PointerMotionMask | ButtonPressMask | ButtonReleaseMask,
-                       GrabModeAsync, GrabModeAsync, clip_window, None, CurrentTime ))
+    if (no_pointer_grab)
+        clipping_cursor = TRUE;  /* no X grab, but keep the clipping state consistent */
+    else if (!XGrabPointer( data->display, clip_window, False,
+                            PointerMotionMask | ButtonPressMask | ButtonReleaseMask,
+                            GrabModeAsync, GrabModeAsync, clip_window, None, CurrentTime ))
         clipping_cursor = TRUE;
 
     SERVER_START_REQ( set_cursor )
@@ -602,9 +615,77 @@ static POINT map_event_coords( HWND hwnd, Window window, Window event_root, POIN
     return dst;
 }
 
+/* WINE_X11_MOUSE_AS_TOUCH: 0 = disabled, 1 = legacy touch extra-info, 2 = WM_POINTER */
+static int mouse_as_touch_mode(void)
+{
+    static int mode = -1;
+    if (mode == -1)
+    {
+        const char *env = getenv( "WINE_X11_MOUSE_AS_TOUCH" );
+        if (!env || !*env) mode = 0;
+        else if (env[0] == 'p') mode = 2;   /* "pointer" */
+        else mode = 1;
+    }
+    return mode;
+}
+
+static BOOL pointer_in_contact;
+
+/* Feed a synthetic touch pointer through the wineserver, which turns it into
+ * WM_POINTERDOWN/UPDATE/UP with source IMDT_TOUCH (PT_TOUCH).  This is the path
+ * WinRT CoreIndependentInputSource listeners (UWP-style games) actually use. */
+static void send_pointer_input( HWND hwnd, POINT pos, UINT msg, WORD flags )
+{
+    RECT virtual = NtUserGetVirtualScreenRect( MDT_RAW_DPI );
+    INPUT input = { .type = INPUT_HARDWARE };
+    int width = virtual.right - virtual.left, height = virtual.bottom - virtual.top;
+    LONG x, y;
+
+    if (!hwnd || width <= 0 || height <= 0) return;
+
+    x = (pos.x - virtual.left) * 65535 / width;
+    y = (pos.y - virtual.top) * 65535 / height;
+    if (x < 0) x = 0; else if (x > 65535) x = 65535;
+    if (y < 0) y = 0; else if (y > 65535) y = 65535;
+
+    input.hi.uMsg = msg;
+    input.hi.wParamL = 2;   /* pointer id; id 1 is reserved for the mouse */
+    input.hi.wParamH = flags;
+    NtUserSendHardwareInput( hwnd, 0, &input, MAKELPARAM( x, y ) );
+
+    TRACE( "pointer msg %#x id 2 at %d,%d flags %#x\n", msg, x, y, flags );
+}
+
 static void send_mouse_input( HWND hwnd, POINT pos, UINT flags, UINT data, UINT time, const struct raw_mouse *raw )
 {
     INPUT input = { .type = INPUT_MOUSE };
+    int mode = mouse_as_touch_mode();
+
+    if (mode == 2 && hwnd && !raw && (flags & MOUSEEVENTF_ABSOLUTE))
+    {
+        if (flags & MOUSEEVENTF_LEFTDOWN)
+        {
+            pointer_in_contact = TRUE;
+            send_pointer_input( hwnd, pos, WM_POINTERDOWN,
+                                POINTER_MESSAGE_FLAG_NEW | POINTER_MESSAGE_FLAG_INRANGE |
+                                POINTER_MESSAGE_FLAG_INCONTACT );
+            return;
+        }
+        if (flags & MOUSEEVENTF_LEFTUP)
+        {
+            pointer_in_contact = FALSE;
+            send_pointer_input( hwnd, pos, WM_POINTERUP, POINTER_MESSAGE_FLAG_INRANGE );
+            return;
+        }
+        if (!(flags & (MOUSEEVENTF_RIGHTDOWN | MOUSEEVENTF_RIGHTUP | MOUSEEVENTF_MIDDLEDOWN |
+                       MOUSEEVENTF_MIDDLEUP | MOUSEEVENTF_WHEEL | MOUSEEVENTF_HWHEEL |
+                       MOUSEEVENTF_XDOWN | MOUSEEVENTF_XUP)) && pointer_in_contact)
+        {
+            send_pointer_input( hwnd, pos, WM_POINTERUPDATE,
+                                POINTER_MESSAGE_FLAG_INRANGE | POINTER_MESSAGE_FLAG_INCONTACT );
+            return;
+        }
+    }
 
     if ((flags & MOUSEEVENTF_ABSOLUTE) || pos.x || pos.y) flags |= MOUSEEVENTF_MOVE;
 
@@ -613,6 +694,7 @@ static void send_mouse_input( HWND hwnd, POINT pos, UINT flags, UINT data, UINT 
     input.mi.dwFlags = flags;
     input.mi.mouseData = data;
     input.mi.time = time;
+    if (mode == 1) input.mi.dwExtraInfo = 0xff515780;
 
     NtUserSendHardwareInput( hwnd, SEND_HWMSG_RAWINPUT, &input, (LPARAM)raw );
 }
@@ -1438,7 +1520,7 @@ BOOL X11DRV_SetCursorPos( INT x, INT y )
         return FALSE;
     }
 
-    if (!clipping_cursor &&
+    if (!clipping_cursor && !no_pointer_grab &&
         XGrabPointer( data->display, root_window, False,
                       PointerMotionMask | ButtonPressMask | ButtonReleaseMask,
                       GrabModeAsync, GrabModeAsync, None, None, CurrentTime ) != GrabSuccess)
@@ -1450,7 +1532,7 @@ BOOL X11DRV_SetCursorPos( INT x, INT y )
     XWarpPointer( data->display, root_window, root_window, 0, 0, 0, 0, pos.x, pos.y );
     data->warp_serial = NextRequest( data->display );
 
-    if (!clipping_cursor)
+    if (!clipping_cursor && !no_pointer_grab)
         XUngrabPointer( data->display, CurrentTime );
 
     XNoOp( data->display );

@@ -1,0 +1,40 @@
+--- a/dlls/d3dcompiler_43/compiler.c
++++ b/dlls/d3dcompiler_43/compiler.c
+@@ -80,15 +80,22 @@
+ {
+     struct d3dcompiler_include_from_file *include = impl_from_ID3DInclude(iface);
+     char *fullpath, *buffer = NULL, current_dir[MAX_PATH + 1];
+-    const char *initial_dir;
++    const char *initial_dir, *last_sep, *ptr;
+     SIZE_T size;
+     HANDLE file;
+     ULONG read;
+     DWORD len;
+ 
+-    if ((initial_dir = strrchr(include->initial_filename, '\\')))
++    /* The filename may use either backslashes or forward slashes. */
++    for (ptr = include->initial_filename, last_sep = NULL; *ptr; ++ptr)
+     {
+-        len = initial_dir - include->initial_filename + 1;
++        if (*ptr == '/' || *ptr == '\\')
++            last_sep = ptr;
++    }
++
++    if (last_sep)
++    {
++        len = last_sep - include->initial_filename + 1;
+         initial_dir = include->initial_filename;
+     }
+     else
+@@ -108,6 +115,11 @@
+ 
+     file = CreateFileA(fullpath, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, 0, 0);
+     if (file == INVALID_HANDLE_VALUE)
++    {
++        /* Also try the include name on its own, like d3dcompiler does. */
++        file = CreateFileA(filename, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, 0, 0);
++    }
++    if (file == INVALID_HANDLE_VALUE)
+         goto error;
+ 
+     TRACE("Include file found at %s.\n", debugstr_a(fullpath));

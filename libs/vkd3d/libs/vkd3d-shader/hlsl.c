@@ -2217,6 +2217,7 @@ static struct hlsl_ir_resource_load *hlsl_new_resource_load(struct hlsl_ctx *ctx
         return NULL;
     init_node(&load->node, HLSL_IR_RESOURCE_LOAD, params->format, loc);
     load->load_type = params->type;
+    load->lod_unclamped = params->lod_unclamped;
 
     if (!hlsl_deref_init_from_index_chain(&load->resource, params->resource, ctx))
     {
@@ -3995,6 +3996,7 @@ static void dump_ir_resource_load(struct vkd3d_string_buffer *buffer, const stru
         [HLSL_RESOURCE_GATHER_ALPHA] = "gather_alpha",
         [HLSL_RESOURCE_SAMPLE_INFO] = "sample_info",
         [HLSL_RESOURCE_RESINFO] = "resinfo",
+        [HLSL_RESOURCE_LOD] = "lod",
     };
 
     VKD3D_ASSERT(load->load_type < ARRAY_SIZE(type_names));

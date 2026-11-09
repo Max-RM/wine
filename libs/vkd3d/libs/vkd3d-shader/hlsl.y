@@ -6699,6 +6699,47 @@ static bool add_so_restartstrip_method_call(struct hlsl_ctx *ctx, struct hlsl_bl
     return true;
 }
 
+static bool add_calculate_lod_method_call(struct hlsl_ctx *ctx, struct hlsl_block *block,
+        struct hlsl_ir_node *object, const char *name, const struct parse_initializer *params,
+        const struct vkd3d_shader_location *loc)
+{
+    const struct hlsl_type *object_type = object->data_type;
+    struct hlsl_resource_load_params load_params = { 0 };
+    const struct hlsl_type *sampler_type;
+    unsigned int sampler_dim;
+
+    if (params->args_count != 2)
+    {
+        hlsl_error(ctx, loc, VKD3D_SHADER_ERROR_HLSL_WRONG_PARAMETER_COUNT,
+                "Wrong number of arguments to method '%s': expected 2, but got %u.",
+                name, params->args_count);
+        return false;
+    }
+
+    sampler_type = params->args[0]->data_type;
+    if (sampler_type->class != HLSL_CLASS_SAMPLER || sampler_type->sampler_dim != HLSL_SAMPLER_DIM_GENERIC)
+    {
+        struct vkd3d_string_buffer *string;
+
+        if ((string = hlsl_type_to_string(ctx, sampler_type)))
+            hlsl_error(ctx, loc, VKD3D_SHADER_ERROR_HLSL_INVALID_TYPE,
+                    "Wrong type for argument 0 of %s(): expected 'sampler', but got '%s'.", name, string->buffer);
+        hlsl_release_string_buffer(ctx, string);
+        return false;
+    }
+
+    sampler_dim = hlsl_sampler_dim_count(object_type->sampler_dim);
+    load_params.type = HLSL_RESOURCE_LOD;
+    load_params.lod_unclamped = !strcmp(name, "CalculateLevelOfDetailUnclamped");
+    load_params.format = hlsl_get_scalar_type(ctx, HLSL_TYPE_FLOAT);
+    load_params.resource = object;
+    load_params.sampler = params->args[0];
+    load_params.coords = add_implicit_conversion(ctx, block, params->args[1],
+            hlsl_get_vector_type(ctx, HLSL_TYPE_FLOAT, sampler_dim), loc);
+    hlsl_block_add_resource_load(ctx, block, &load_params, loc);
+    return true;
+}
+
 static const struct method_function
 {
     const char *name;
@@ -6708,6 +6749,9 @@ static const struct method_function
 }
 texture_methods[] =
 {
+    { "CalculateLevelOfDetail",          add_calculate_lod_method_call, "00111111001000" },
+    { "CalculateLevelOfDetailUnclamped", add_calculate_lod_method_call, "00111111001000" },
+
     { "Gather",             add_gather_method_call,        "00010101001000" },
     { "GatherAlpha",        add_gather_method_call,        "00010101001000" },
     { "GatherBlue",         add_gather_method_call,        "00010101001000" },

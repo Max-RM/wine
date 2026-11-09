@@ -1,0 +1,20 @@
+#!/bin/sh
+# armv7-w64-mingw32-clang — PE-компилятор для Wine ARM32 (armhf-хост).
+#
+# Обёртка нужна, потому что winegcc не передаёт -fuse-ld=lld и не знает
+# про llvm-mingw-специфику. Sysroot ожидается в стандартном для Debian
+# месте: /usr/armv7-w64-mingw32 (см. BUILD-WINE11.md).
+#
+# ccache включается переменной WINE_CCACHE=1 (если ccache установлен).
+
+if [ "${WINE_CCACHE:-0}" = 1 ] && command -v ccache >/dev/null 2>&1; then
+    exec ccache /usr/bin/clang \
+      --target=armv7-windows-gnu -march=armv7-a -mfpu=neon \
+      -fuse-ld=lld -rtlib=compiler-rt -stdlib=libc++ \
+      -Wno-unused-command-line-argument "$@" -lc++ -lc++abi -lunwind -lgcc
+fi
+
+exec /usr/bin/clang \
+  --target=armv7-windows-gnu -march=armv7-a -mfpu=neon \
+  -fuse-ld=lld -rtlib=compiler-rt -stdlib=libc++ \
+  -Wno-unused-command-line-argument "$@" -lc++ -lc++abi -lunwind -lgcc

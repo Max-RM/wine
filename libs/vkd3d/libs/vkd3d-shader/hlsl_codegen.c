@@ -5804,6 +5804,7 @@ static bool lower_combined_samples(struct hlsl_ctx *ctx, struct hlsl_ir_node *in
         case HLSL_RESOURCE_GATHER_CMP_BLUE:
         case HLSL_RESOURCE_GATHER_CMP_ALPHA:
         case HLSL_RESOURCE_RESINFO:
+        case HLSL_RESOURCE_LOD:
         case HLSL_RESOURCE_SAMPLE_CMP:
         case HLSL_RESOURCE_SAMPLE_CMP_LZ:
         case HLSL_RESOURCE_SAMPLE_INFO:
@@ -13672,6 +13673,44 @@ static uint32_t get_gather_swizzle(enum hlsl_resource_load_type type)
     return 0;
 }
 
+static bool sm4_generate_vsir_instr_lod(struct hlsl_ctx *ctx,
+        struct vsir_program *program, const struct hlsl_ir_resource_load *load)
+{
+    const struct hlsl_ir_node *coords = load->coords.node;
+    const struct hlsl_deref *resource = &load->resource;
+    const struct hlsl_deref *sampler = &load->sampler;
+    const struct hlsl_ir_node *instr = &load->node;
+    struct vkd3d_shader_instruction *ins;
+    unsigned int component;
+
+    if (!(ins = generate_vsir_add_program_instruction(ctx, program, &instr->loc, VSIR_OP_LOD, 1, 3)))
+        return false;
+
+    vsir_dst_from_hlsl_node(&ins->dst[0], ctx, instr);
+
+    vsir_src_from_hlsl_node(&ins->src[0], ctx, coords, VKD3DSP_WRITEMASK_ALL);
+
+    if (!sm4_generate_vsir_init_src_operand_from_deref(ctx, program,
+            &ins->src[1], resource, VKD3DSP_WRITEMASK_ALL, &instr->loc))
+        return false;
+
+    /* The lod instruction selects the clamped or unclamped level of detail
+     * from the two components returned by the backend, using the swizzle of
+     * the resource operand. */
+    component = load->lod_unclamped ? 1 : 0;
+    ins->src[1].swizzle = vkd3d_shader_create_swizzle(
+            (enum vkd3d_shader_swizzle_component)component,
+            (enum vkd3d_shader_swizzle_component)component,
+            (enum vkd3d_shader_swizzle_component)component,
+            (enum vkd3d_shader_swizzle_component)component);
+
+    if (!sm4_generate_vsir_init_src_operand_from_deref(ctx, program,
+            &ins->src[2], sampler, VKD3DSP_WRITEMASK_ALL, &instr->loc))
+        return false;
+
+    return true;
+}
+
 static bool sm4_generate_vsir_instr_resource_load(struct hlsl_ctx *ctx,
         struct vsir_program *program, const struct hlsl_ir_resource_load *load)
 {
@@ -13691,6 +13730,9 @@ static bool sm4_generate_vsir_instr_resource_load(struct hlsl_ctx *ctx,
     {
         case HLSL_RESOURCE_LOAD:
             return sm4_generate_vsir_instr_ld(ctx, program, load);
+
+        case HLSL_RESOURCE_LOD:
+            return sm4_generate_vsir_instr_lod(ctx, program, load);
 
         case HLSL_RESOURCE_SAMPLE:
         case HLSL_RESOURCE_SAMPLE_CMP:
