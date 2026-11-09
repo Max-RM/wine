@@ -1237,17 +1237,40 @@ static void set_wm_hints( struct x11drv_win_data *data )
 }
 
 
+static int clip_window_error( Display *display, XErrorEvent *event, void *arg )
+{
+    return (event->error_code == BadWindow);
+}
+
 /***********************************************************************
  *     init_clip_window
  */
 Window init_clip_window(void)
 {
     struct x11drv_thread_data *data = x11drv_init_thread_data();
+    XWindowAttributes attr;
+    BOOL valid;
 
     if (!data->clip_window &&
         (data->clip_window = (Window)NtUserGetProp( NtUserGetDesktopWindow(), clip_window_prop )))
     {
-        XSelectInput( data->display, data->clip_window, StructureNotifyMask );
+        /* The clipping window can be destroyed together with the desktop
+         * window and recreated by another process, leaving a stale window id
+         * in the property.  Validate it before use, otherwise the first X
+         * request on it raises a fatal BadWindow error. */
+        X11DRV_expect_error( data->display, clip_window_error, NULL );
+        valid = XGetWindowAttributes( data->display, data->clip_window, &attr ) != 0;
+        if (X11DRV_check_error()) valid = FALSE;
+        if (!valid)
+        {
+            WARN( "ignoring stale clipping window %lx\n", data->clip_window );
+            NtUserRemoveProp( NtUserGetDesktopWindow(), clip_window_prop );
+            data->clip_window = 0;
+        }
+        else
+        {
+            XSelectInput( data->display, data->clip_window, StructureNotifyMask );
+        }
     }
     return data->clip_window;
 }
@@ -2683,7 +2706,10 @@ static BOOL create_desktop_win_data( Window win, HWND hwnd )
     set_initial_wm_hints( display, win );
     if (is_desktop_fullscreen()) window_set_net_wm_state( data, (1 << NET_WM_STATE_FULLSCREEN) );
     release_win_data( data );
-    if (thread_data->clip_window) XReparentWindow( display, thread_data->clip_window, win, 0, 0 );
+    /* Keep the clipping window as a child of the root window.  Reparenting it
+     * into the desktop window makes it die whenever the desktop window is
+     * recreated, which leaves a stale window id in the clip_window property. */
+    if (thread_data->clip_window) XReparentWindow( display, thread_data->clip_window, root_window, 0, 0 );
     return TRUE;
 }
 
@@ -3132,9 +3158,10 @@ void X11DRV_SetCapture( HWND hwnd, UINT flags, HWND previous )
         if (!(data = get_win_data( hwnd ))) return;
         if (data->whole_window)
         {
-            XGrabPointer( data->display, data->whole_window, False,
-                          PointerMotionMask | ButtonPressMask | ButtonReleaseMask,
-                          GrabModeAsync, GrabModeAsync, None, None, CurrentTime );
+            if (!no_pointer_grab)
+                XGrabPointer( data->display, data->whole_window, False,
+                              PointerMotionMask | ButtonPressMask | ButtonReleaseMask,
+                              GrabModeAsync, GrabModeAsync, None, None, CurrentTime );
             XFlush( data->display );
         }
         release_win_data( data );

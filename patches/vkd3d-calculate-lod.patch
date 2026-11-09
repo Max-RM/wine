@@ -1,0 +1,272 @@
+--- a/libs/vkd3d/libs/vkd3d-shader/hlsl.h
++++ b/libs/vkd3d/libs/vkd3d-shader/hlsl.h
+@@ -925,12 +925,14 @@
+     HLSL_RESOURCE_GATHER_CMP_ALPHA,
+     HLSL_RESOURCE_SAMPLE_INFO,
+     HLSL_RESOURCE_RESINFO,
++    HLSL_RESOURCE_LOD,
+ };
+ 
+ struct hlsl_ir_resource_load
+ {
+     struct hlsl_ir_node node;
+     enum hlsl_resource_load_type load_type;
++    bool lod_unclamped;
+     struct hlsl_deref resource, sampler;
+     struct hlsl_src byte_offset, coords, lod, ddx, ddy, cmp, sample_index, texel_offset;
+     enum hlsl_sampler_dim sampling_dim;
+@@ -1292,6 +1294,7 @@
+ {
+     struct hlsl_type *format;
+     enum hlsl_resource_load_type type;
++    bool lod_unclamped;
+     struct hlsl_ir_node *resource, *sampler;
+     struct hlsl_ir_node *coords, *lod, *ddx, *ddy, *cmp, *sample_index, *texel_offset;
+     enum hlsl_sampler_dim sampling_dim;
+--- a/libs/vkd3d/libs/vkd3d-shader/hlsl.c
++++ b/libs/vkd3d/libs/vkd3d-shader/hlsl.c
+@@ -2217,6 +2217,7 @@
+         return NULL;
+     init_node(&load->node, HLSL_IR_RESOURCE_LOAD, params->format, loc);
+     load->load_type = params->type;
++    load->lod_unclamped = params->lod_unclamped;
+ 
+     if (!hlsl_deref_init_from_index_chain(&load->resource, params->resource, ctx))
+     {
+@@ -3995,6 +3996,7 @@
+         [HLSL_RESOURCE_GATHER_ALPHA] = "gather_alpha",
+         [HLSL_RESOURCE_SAMPLE_INFO] = "sample_info",
+         [HLSL_RESOURCE_RESINFO] = "resinfo",
++        [HLSL_RESOURCE_LOD] = "lod",
+     };
+ 
+     VKD3D_ASSERT(load->load_type < ARRAY_SIZE(type_names));
+--- a/libs/vkd3d/libs/vkd3d-shader/hlsl.y
++++ b/libs/vkd3d/libs/vkd3d-shader/hlsl.y
+@@ -6699,6 +6699,47 @@
+     return true;
+ }
+ 
++static bool add_calculate_lod_method_call(struct hlsl_ctx *ctx, struct hlsl_block *block,
++        struct hlsl_ir_node *object, const char *name, const struct parse_initializer *params,
++        const struct vkd3d_shader_location *loc)
++{
++    const struct hlsl_type *object_type = object->data_type;
++    struct hlsl_resource_load_params load_params = { 0 };
++    const struct hlsl_type *sampler_type;
++    unsigned int sampler_dim;
++
++    if (params->args_count != 2)
++    {
++        hlsl_error(ctx, loc, VKD3D_SHADER_ERROR_HLSL_WRONG_PARAMETER_COUNT,
++                "Wrong number of arguments to method '%s': expected 2, but got %u.",
++                name, params->args_count);
++        return false;
++    }
++
++    sampler_type = params->args[0]->data_type;
++    if (sampler_type->class != HLSL_CLASS_SAMPLER || sampler_type->sampler_dim != HLSL_SAMPLER_DIM_GENERIC)
++    {
++        struct vkd3d_string_buffer *string;
++
++        if ((string = hlsl_type_to_string(ctx, sampler_type)))
++            hlsl_error(ctx, loc, VKD3D_SHADER_ERROR_HLSL_INVALID_TYPE,
++                    "Wrong type for argument 0 of %s(): expected 'sampler', but got '%s'.", name, string->buffer);
++        hlsl_release_string_buffer(ctx, string);
++        return false;
++    }
++
++    sampler_dim = hlsl_sampler_dim_count(object_type->sampler_dim);
++    load_params.type = HLSL_RESOURCE_LOD;
++    load_params.lod_unclamped = !strcmp(name, "CalculateLevelOfDetailUnclamped");
++    load_params.format = hlsl_get_scalar_type(ctx, HLSL_TYPE_FLOAT);
++    load_params.resource = object;
++    load_params.sampler = params->args[0];
++    load_params.coords = add_implicit_conversion(ctx, block, params->args[1],
++            hlsl_get_vector_type(ctx, HLSL_TYPE_FLOAT, sampler_dim), loc);
++    hlsl_block_add_resource_load(ctx, block, &load_params, loc);
++    return true;
++}
++
+ static const struct method_function
+ {
+     const char *name;
+@@ -6708,6 +6749,9 @@
+ }
+ texture_methods[] =
+ {
++    { "CalculateLevelOfDetail",          add_calculate_lod_method_call, "00111111001000" },
++    { "CalculateLevelOfDetailUnclamped", add_calculate_lod_method_call, "00111111001000" },
++
+     { "Gather",             add_gather_method_call,        "00010101001000" },
+     { "GatherAlpha",        add_gather_method_call,        "00010101001000" },
+     { "GatherBlue",         add_gather_method_call,        "00010101001000" },
+--- a/libs/vkd3d/libs/vkd3d-shader/hlsl_codegen.c
++++ b/libs/vkd3d/libs/vkd3d-shader/hlsl_codegen.c
+@@ -5804,6 +5804,7 @@
+         case HLSL_RESOURCE_GATHER_CMP_BLUE:
+         case HLSL_RESOURCE_GATHER_CMP_ALPHA:
+         case HLSL_RESOURCE_RESINFO:
++        case HLSL_RESOURCE_LOD:
+         case HLSL_RESOURCE_SAMPLE_CMP:
+         case HLSL_RESOURCE_SAMPLE_CMP_LZ:
+         case HLSL_RESOURCE_SAMPLE_INFO:
+@@ -13672,6 +13673,44 @@
+     return 0;
+ }
+ 
++static bool sm4_generate_vsir_instr_lod(struct hlsl_ctx *ctx,
++        struct vsir_program *program, const struct hlsl_ir_resource_load *load)
++{
++    const struct hlsl_ir_node *coords = load->coords.node;
++    const struct hlsl_deref *resource = &load->resource;
++    const struct hlsl_deref *sampler = &load->sampler;
++    const struct hlsl_ir_node *instr = &load->node;
++    struct vkd3d_shader_instruction *ins;
++    unsigned int component;
++
++    if (!(ins = generate_vsir_add_program_instruction(ctx, program, &instr->loc, VSIR_OP_LOD, 1, 3)))
++        return false;
++
++    vsir_dst_from_hlsl_node(&ins->dst[0], ctx, instr);
++
++    vsir_src_from_hlsl_node(&ins->src[0], ctx, coords, VKD3DSP_WRITEMASK_ALL);
++
++    if (!sm4_generate_vsir_init_src_operand_from_deref(ctx, program,
++            &ins->src[1], resource, VKD3DSP_WRITEMASK_ALL, &instr->loc))
++        return false;
++
++    /* The lod instruction selects the clamped or unclamped level of detail
++     * from the two components returned by the backend, using the swizzle of
++     * the resource operand. */
++    component = load->lod_unclamped ? 1 : 0;
++    ins->src[1].swizzle = vkd3d_shader_create_swizzle(
++            (enum vkd3d_shader_swizzle_component)component,
++            (enum vkd3d_shader_swizzle_component)component,
++            (enum vkd3d_shader_swizzle_component)component,
++            (enum vkd3d_shader_swizzle_component)component);
++
++    if (!sm4_generate_vsir_init_src_operand_from_deref(ctx, program,
++            &ins->src[2], sampler, VKD3DSP_WRITEMASK_ALL, &instr->loc))
++        return false;
++
++    return true;
++}
++
+ static bool sm4_generate_vsir_instr_resource_load(struct hlsl_ctx *ctx,
+         struct vsir_program *program, const struct hlsl_ir_resource_load *load)
+ {
+@@ -13692,6 +13731,9 @@
+         case HLSL_RESOURCE_LOAD:
+             return sm4_generate_vsir_instr_ld(ctx, program, load);
+ 
++        case HLSL_RESOURCE_LOD:
++            return sm4_generate_vsir_instr_lod(ctx, program, load);
++
+         case HLSL_RESOURCE_SAMPLE:
+         case HLSL_RESOURCE_SAMPLE_CMP:
+         case HLSL_RESOURCE_SAMPLE_CMP_LZ:
+--- a/libs/vkd3d/libs/vkd3d-shader/glsl.c
++++ b/libs/vkd3d/libs/vkd3d-shader/glsl.c
+@@ -1087,6 +1087,91 @@
+     }
+ }
+ 
++static void shader_glsl_lod(struct vkd3d_glsl_generator *gen, const struct vkd3d_shader_instruction *ins)
++{
++    const struct glsl_resource_type_info *resource_type_info;
++    unsigned int resource_id, resource_idx, resource_space;
++    unsigned int sampler_id, sampler_idx, sampler_space;
++    const struct vsir_src_operand *resource, *sampler;
++    enum vkd3d_shader_resource_type resource_type;
++    struct vkd3d_string_buffer *sampler_name, *lod;
++    unsigned int coord_size, component_idx;
++    const struct vsir_descriptor *d;
++    struct glsl_dst dst;
++
++    resource = &ins->src[1];
++    sampler = &ins->src[2];
++
++    if (resource->reg.idx[0].rel_addr || resource->reg.idx[1].rel_addr
++            || sampler->reg.idx[0].rel_addr || sampler->reg.idx[1].rel_addr)
++        vkd3d_glsl_compiler_error(gen, VKD3D_SHADER_ERROR_GLSL_UNSUPPORTED,
++                "Descriptor indexing is not supported.");
++
++    resource_id = resource->reg.idx[0].offset;
++    resource_idx = resource->reg.idx[1].offset;
++    if ((d = vkd3d_shader_find_descriptor(&gen->program->descriptors,
++            VKD3D_SHADER_DESCRIPTOR_TYPE_SRV, resource_id)))
++    {
++        resource_type = d->resource_type;
++        resource_space = d->register_space;
++    }
++    else
++    {
++        vkd3d_glsl_compiler_error(gen, VKD3D_SHADER_ERROR_GLSL_INTERNAL,
++                "Internal compiler error: Undeclared resource descriptor %u.", resource_id);
++        resource_space = 0;
++        resource_type = VKD3D_SHADER_RESOURCE_TEXTURE_2D;
++    }
++
++    if ((resource_type_info = shader_glsl_get_resource_type_info(resource_type)))
++        coord_size = resource_type_info->coord_size;
++    else
++    {
++        vkd3d_glsl_compiler_error(gen, VKD3D_SHADER_ERROR_GLSL_INTERNAL,
++                "Internal compiler error: Unhandled resource type %#x.", resource_type);
++        coord_size = 2;
++    }
++
++    sampler_id = sampler->reg.idx[0].offset;
++    sampler_idx = sampler->reg.idx[1].offset;
++    if ((d = vkd3d_shader_find_descriptor(&gen->program->descriptors,
++            VKD3D_SHADER_DESCRIPTOR_TYPE_SAMPLER, sampler_id)))
++        sampler_space = d->register_space;
++    else
++    {
++        vkd3d_glsl_compiler_error(gen, VKD3D_SHADER_ERROR_GLSL_INTERNAL,
++                "Internal compiler error: Undeclared sampler descriptor %u.", sampler_id);
++        sampler_space = 0;
++    }
++
++    glsl_dst_init(&dst, gen, ins, &ins->dst[0]);
++    sampler_name = vkd3d_string_buffer_get(&gen->string_buffers);
++    lod = vkd3d_string_buffer_get(&gen->string_buffers);
++
++    shader_glsl_print_combined_sampler_name(sampler_name, gen,
++            resource_idx, resource_space, sampler_idx, sampler_space);
++
++    /* Component 0 selects the clamped LOD, component 1 the unclamped one. */
++    component_idx = vsir_swizzle_get_component(resource->swizzle, 0);
++    if (component_idx)
++        vkd3d_string_buffer_printf(lod, "textureQueryLod(%s, ", sampler_name->buffer);
++    else
++        vkd3d_string_buffer_printf(lod, "clamp(textureQueryLod(%s, ", sampler_name->buffer);
++    shader_glsl_print_src(lod, gen, &ins->src[0],
++            vkd3d_write_mask_from_component_count(coord_size), ins->src[0].reg.data_type);
++    if (component_idx)
++        vkd3d_string_buffer_printf(lod, ").y");
++    else
++        vkd3d_string_buffer_printf(lod, ").y, 0.0, float(textureQueryLevels(%s) - 1))",
++                sampler_name->buffer);
++
++    shader_glsl_print_assignment(gen, &dst, "%s", lod->buffer);
++
++    vkd3d_string_buffer_release(&gen->string_buffers, lod);
++    vkd3d_string_buffer_release(&gen->string_buffers, sampler_name);
++    glsl_dst_cleanup(&dst, &gen->string_buffers);
++}
++
+ static void shader_glsl_sample(struct vkd3d_glsl_generator *gen, const struct vkd3d_shader_instruction *ins)
+ {
+     bool shadow_sampler, array, bias, dynamic_offset, gather, grad, lod, lod_zero, offset, shadow;
+@@ -1974,6 +2059,9 @@
+             break;
+         case VSIR_OP_GATHER4:
+         case VSIR_OP_GATHER4_PO:
++        case VSIR_OP_LOD:
++            shader_glsl_lod(gen, ins);
++            break;
+         case VSIR_OP_SAMPLE:
+         case VSIR_OP_SAMPLE_B:
+         case VSIR_OP_SAMPLE_C:

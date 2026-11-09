@@ -71,6 +71,8 @@ BOOL use_take_focus = TRUE;
 BOOL use_primary_selection = FALSE;
 BOOL use_system_cursors = TRUE;
 BOOL grab_fullscreen = FALSE;
+/* opt-in: disable XGrabPointer (cursor clipping / mouse capture) */
+BOOL no_pointer_grab = FALSE;
 BOOL managed_mode = TRUE;
 BOOL private_color_map = FALSE;
 int primary_monitor = 0;
@@ -469,6 +471,15 @@ static void setup_options(void)
 
     if (!get_config_key( hkey, appkey, "GrabFullscreen", buffer, sizeof(buffer) ))
         grab_fullscreen = IS_OPTION_TRUE( buffer[0] );
+
+    if (!get_config_key( hkey, appkey, "NoPointerGrab", buffer, sizeof(buffer) ))
+        no_pointer_grab = IS_OPTION_TRUE( buffer[0] );
+
+    /* WINE_X11_NO_POINTER_GRAB overrides the registry setting (1 = on, 0 = off) */
+    {
+        const char *env = getenv( "WINE_X11_NO_POINTER_GRAB" );
+        if (env && *env) no_pointer_grab = (env[0] != '0');
+    }
 
     if (!get_config_key( hkey, appkey, "ScreenDepth", buffer, sizeof(buffer) ))
         default_visual.depth = wcstol( buffer, NULL, 0 );

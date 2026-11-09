@@ -58,3 +58,10 @@ dlls/win32u/vertical.c generated
 dlls/wineps.drv/direction.c generated
 dlls/wineps.drv/vertical.c generated
 nls/*.nls generated
+
+# ARM32 patches and helper scripts must stay LF on every platform
+*.patch text eol=lf
+build/build-wine11.sh text eol=lf
+build/toolchain/armv7-w64-mingw32-clang text eol=lf
+wine-env.sh text eol=lf
+wine-run.sh text eol=lf

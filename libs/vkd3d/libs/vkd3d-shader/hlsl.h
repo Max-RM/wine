@@ -925,12 +925,14 @@ enum hlsl_resource_load_type
     HLSL_RESOURCE_GATHER_CMP_ALPHA,
     HLSL_RESOURCE_SAMPLE_INFO,
     HLSL_RESOURCE_RESINFO,
+    HLSL_RESOURCE_LOD,
 };
 
 struct hlsl_ir_resource_load
 {
     struct hlsl_ir_node node;
     enum hlsl_resource_load_type load_type;
+    bool lod_unclamped;
     struct hlsl_deref resource, sampler;
     struct hlsl_src byte_offset, coords, lod, ddx, ddy, cmp, sample_index, texel_offset;
     enum hlsl_sampler_dim sampling_dim;
@@ -1292,6 +1294,7 @@ struct hlsl_resource_load_params
 {
     struct hlsl_type *format;
     enum hlsl_resource_load_type type;
+    bool lod_unclamped;
     struct hlsl_ir_node *resource, *sampler;
     struct hlsl_ir_node *coords, *lod, *ddx, *ddy, *cmp, *sample_index, *texel_offset;
     enum hlsl_sampler_dim sampling_dim;

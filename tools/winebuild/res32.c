@@ -22,10 +22,12 @@
 
 #include <assert.h>
 #include <ctype.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <unistd.h>
 
 #include "build.h"
 
@@ -439,9 +441,21 @@ void output_resources( DLLSPEC *spec )
     i = 0;
     ARRAY_FOR_EACH( res, &spec->resources, struct resource )
     {
+        /* LLVM's integrated assembler mmaps the whole input file for every
+         * .incbin directive, so a large resource file with thousands of
+         * resources exhausts the 32-bit address space on ARM.  Write each
+         * resource to its own small file instead. */
+        char *name = make_temp_file( "res", ".bin" );
+        FILE *f = fopen( name, "wb" );
+
+        if (!f) fatal_error( "cannot create %s\n", name );
+        if (res->data_size && fwrite( res->data, 1, res->data_size, f ) != res->data_size)
+            fatal_error( "cannot write %s\n", name );
+        fclose( f );
+
         output( "\n\t.balign 4\n" );
         output( ".L__wine_spec_res_%d:\n", i++ );
-        output( "\t.incbin \"%s\",%d,%d\n", res->input_name, res->input_offset, res->data_size );
+        output( "\t.incbin \"%s\"\n", name );
     }
 
     if (!is_pe())

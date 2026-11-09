@@ -1087,6 +1087,91 @@ static void shader_glsl_print_shadow_coord(struct vkd3d_string_buffer *buffer, s
     }
 }
 
+static void shader_glsl_lod(struct vkd3d_glsl_generator *gen, const struct vkd3d_shader_instruction *ins)
+{
+    const struct glsl_resource_type_info *resource_type_info;
+    unsigned int resource_id, resource_idx, resource_space;
+    unsigned int sampler_id, sampler_idx, sampler_space;
+    const struct vsir_src_operand *resource, *sampler;
+    enum vkd3d_shader_resource_type resource_type;
+    struct vkd3d_string_buffer *sampler_name, *lod;
+    unsigned int coord_size, component_idx;
+    const struct vsir_descriptor *d;
+    struct glsl_dst dst;
+
+    resource = &ins->src[1];
+    sampler = &ins->src[2];
+
+    if (resource->reg.idx[0].rel_addr || resource->reg.idx[1].rel_addr
+            || sampler->reg.idx[0].rel_addr || sampler->reg.idx[1].rel_addr)
+        vkd3d_glsl_compiler_error(gen, VKD3D_SHADER_ERROR_GLSL_UNSUPPORTED,
+                "Descriptor indexing is not supported.");
+
+    resource_id = resource->reg.idx[0].offset;
+    resource_idx = resource->reg.idx[1].offset;
+    if ((d = vkd3d_shader_find_descriptor(&gen->program->descriptors,
+            VKD3D_SHADER_DESCRIPTOR_TYPE_SRV, resource_id)))
+    {
+        resource_type = d->resource_type;
+        resource_space = d->register_space;
+    }
+    else
+    {
+        vkd3d_glsl_compiler_error(gen, VKD3D_SHADER_ERROR_GLSL_INTERNAL,
+                "Internal compiler error: Undeclared resource descriptor %u.", resource_id);
+        resource_space = 0;
+        resource_type = VKD3D_SHADER_RESOURCE_TEXTURE_2D;
+    }
+
+    if ((resource_type_info = shader_glsl_get_resource_type_info(resource_type)))
+        coord_size = resource_type_info->coord_size;
+    else
+    {
+        vkd3d_glsl_compiler_error(gen, VKD3D_SHADER_ERROR_GLSL_INTERNAL,
+                "Internal compiler error: Unhandled resource type %#x.", resource_type);
+        coord_size = 2;
+    }
+
+    sampler_id = sampler->reg.idx[0].offset;
+    sampler_idx = sampler->reg.idx[1].offset;
+    if ((d = vkd3d_shader_find_descriptor(&gen->program->descriptors,
+            VKD3D_SHADER_DESCRIPTOR_TYPE_SAMPLER, sampler_id)))
+        sampler_space = d->register_space;
+    else
+    {
+        vkd3d_glsl_compiler_error(gen, VKD3D_SHADER_ERROR_GLSL_INTERNAL,
+                "Internal compiler error: Undeclared sampler descriptor %u.", sampler_id);
+        sampler_space = 0;
+    }
+
+    glsl_dst_init(&dst, gen, ins, &ins->dst[0]);
+    sampler_name = vkd3d_string_buffer_get(&gen->string_buffers);
+    lod = vkd3d_string_buffer_get(&gen->string_buffers);
+
+    shader_glsl_print_combined_sampler_name(sampler_name, gen,
+            resource_idx, resource_space, sampler_idx, sampler_space);
+
+    /* Component 0 selects the clamped LOD, component 1 the unclamped one. */
+    component_idx = vsir_swizzle_get_component(resource->swizzle, 0);
+    if (component_idx)
+        vkd3d_string_buffer_printf(lod, "textureQueryLod(%s, ", sampler_name->buffer);
+    else
+        vkd3d_string_buffer_printf(lod, "clamp(textureQueryLod(%s, ", sampler_name->buffer);
+    shader_glsl_print_src(lod, gen, &ins->src[0],
+            vkd3d_write_mask_from_component_count(coord_size), ins->src[0].reg.data_type);
+    if (component_idx)
+        vkd3d_string_buffer_printf(lod, ").y");
+    else
+        vkd3d_string_buffer_printf(lod, ").y, 0.0, float(textureQueryLevels(%s) - 1))",
+                sampler_name->buffer);
+
+    shader_glsl_print_assignment(gen, &dst, "%s", lod->buffer);
+
+    vkd3d_string_buffer_release(&gen->string_buffers, lod);
+    vkd3d_string_buffer_release(&gen->string_buffers, sampler_name);
+    glsl_dst_cleanup(&dst, &gen->string_buffers);
+}
+
 static void shader_glsl_sample(struct vkd3d_glsl_generator *gen, const struct vkd3d_shader_instruction *ins)
 {
     bool shadow_sampler, array, bias, dynamic_offset, gather, grad, lod, lod_zero, offset, shadow;
@@ -1974,6 +2059,9 @@ static void vkd3d_glsl_handle_instruction(struct vkd3d_glsl_generator *gen,
             break;
         case VSIR_OP_GATHER4:
         case VSIR_OP_GATHER4_PO:
+        case VSIR_OP_LOD:
+            shader_glsl_lod(gen, ins);
+            break;
         case VSIR_OP_SAMPLE:
         case VSIR_OP_SAMPLE_B:
         case VSIR_OP_SAMPLE_C:
